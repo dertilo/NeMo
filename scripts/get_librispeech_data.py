@@ -115,7 +115,7 @@ def __process_data(data_folder: str, dst_folder: str, manifest_file: str, audio_
                 entry['text'] = transcript_text
                 entries.append(entry)
 
-    with open(f"{manifest_file}_{audio_format}", 'w') as fout:
+    with open(f"{manifest_file}", 'w') as fout:
         for m in entries:
             fout.write(json.dumps(m) + '\n')
 
@@ -140,13 +140,13 @@ def main():
         __process_data(
             data_folder,
             data_folder + "-processed",
-            os.path.join(data_root, data_set + ".json"),
+            os.path.join(data_root, data_set + "_wav.json"),
             audio_format="wav",
         )
         __process_data(
             data_folder,
             data_folder + "-processed",
-            os.path.join(data_root, data_set + ".json"),
+            os.path.join(data_root, data_set + "_mp3.json"),
             audio_format="mp3",
         )
         #shutil.rmtree(data_folder)
