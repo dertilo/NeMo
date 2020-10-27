@@ -33,6 +33,8 @@ from tqdm import tqdm
 parser = argparse.ArgumentParser(description='LibriSpeech Data download')
 parser.add_argument("--data_root", required=False, default="/tmp/asr_data/ENGLISH", type=str)
 parser.add_argument("--data_sets", default="dev_clean", type=str)
+parser.add_argument("--bits", default=None, type=int)
+parser.add_argument("--format", default="wav", type=str)
 args = parser.parse_args()
 
 URLS = {
@@ -75,7 +77,7 @@ def __extract_file(filepath: str, data_dir: str):
         logging.info('Not extracting. Maybe already there?')
 
 
-def __process_data(data_folder: str, dst_folder: str, manifest_file: str, audio_format = "wav"):
+def __process_data(data_folder: str, dst_folder: str, manifest_file: str, audio_format = "wav",bits=None):
     """
     Converts flac to wav and build manifests's json
     Args:
@@ -84,7 +86,8 @@ def __process_data(data_folder: str, dst_folder: str, manifest_file: str, audio_
         manifest_file: where to store manifest
     Returns:
     """
-    dst_folder = f"{dst_folder}_{audio_format}"
+    bitss = "" if bits is None else f"_{bits}"
+    dst_folder = f"{dst_folder}_{audio_format}{bitss}"
     if not os.path.exists(dst_folder):
         os.makedirs(dst_folder)
 
@@ -105,7 +108,12 @@ def __process_data(data_folder: str, dst_folder: str, manifest_file: str, audio_
                 flac_file = os.path.join(root, id + ".flac")
                 wav_file = os.path.join(dst_folder, f"{id}.{audio_format}")
                 if not os.path.exists(wav_file):
-                    Transformer().build(flac_file, wav_file)
+                    if bits is not None:
+                        cmd = f"sox {flac_file} -C {bits} {wav_file}"
+                    else:
+                        cmd = f"sox {flac_file} {wav_file}"
+                    assert os.system(cmd)==0
+                    # audio_converter.build(flac_file, wav_file,extra_args=["-C",128])
                 # check duration
                 duration = subprocess.check_output("soxi -D {0}".format(wav_file), shell=True)
 
@@ -123,6 +131,7 @@ def __process_data(data_folder: str, dst_folder: str, manifest_file: str, audio_
 def main():
     data_root = args.data_root
     data_sets = args.data_sets
+    bitss = f"_{args.bits}" if args.bits is not None else ""
 
     if data_sets == "ALL":
         data_sets = "dev_clean,dev_other,train_clean_100,train_clean_360,train_other_500,test_clean,test_other"
@@ -140,14 +149,9 @@ def main():
         __process_data(
             data_folder,
             data_folder + "-processed",
-            os.path.join(data_root, data_set + "_wav.json"),
-            audio_format="wav",
-        )
-        __process_data(
-            data_folder,
-            data_folder + "-processed",
-            os.path.join(data_root, data_set + "_mp3.json"),
-            audio_format="mp3",
+            os.path.join(data_root, data_set + f"_{args.format}{bitss}.json"),
+            audio_format=args.format,
+            bits=args.bits
         )
         #shutil.rmtree(data_folder)
 
