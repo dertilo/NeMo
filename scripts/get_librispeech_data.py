@@ -31,7 +31,7 @@ from sox import Transformer
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description='LibriSpeech Data download')
-parser.add_argument("--data_root", required=True, default=None, type=str)
+parser.add_argument("--data_root", required=False, default="/tmp/asr_data/ENGLISH", type=str)
 parser.add_argument("--data_sets", default="dev_clean", type=str)
 args = parser.parse_args()
 
@@ -75,7 +75,7 @@ def __extract_file(filepath: str, data_dir: str):
         logging.info('Not extracting. Maybe already there?')
 
 
-def __process_data(data_folder: str, dst_folder: str, manifest_file: str):
+def __process_data(data_folder: str, dst_folder: str, manifest_file: str, audio_format = "wav"):
     """
     Converts flac to wav and build manifests's json
     Args:
@@ -84,7 +84,7 @@ def __process_data(data_folder: str, dst_folder: str, manifest_file: str):
         manifest_file: where to store manifest
     Returns:
     """
-
+    dst_folder = f"{dst_folder}_{audio_format}"
     if not os.path.exists(dst_folder):
         os.makedirs(dst_folder)
 
@@ -103,7 +103,7 @@ def __process_data(data_folder: str, dst_folder: str, manifest_file: str):
 
                 # Convert FLAC file to WAV
                 flac_file = os.path.join(root, id + ".flac")
-                wav_file = os.path.join(dst_folder, id + ".wav")
+                wav_file = os.path.join(dst_folder, f"{id}.{audio_format}")
                 if not os.path.exists(wav_file):
                     Transformer().build(flac_file, wav_file)
                 # check duration
@@ -115,7 +115,7 @@ def __process_data(data_folder: str, dst_folder: str, manifest_file: str):
                 entry['text'] = transcript_text
                 entries.append(entry)
 
-    with open(manifest_file, 'w') as fout:
+    with open(f"{manifest_file}_{audio_format}", 'w') as fout:
         for m in entries:
             fout.write(json.dumps(m) + '\n')
 
@@ -135,11 +135,22 @@ def main():
         logging.info("Extracting {0}".format(data_set))
         __extract_file(filepath, data_root)
         logging.info("Processing {0}".format(data_set))
+        data_folder = os.path.join(os.path.join(data_root, "LibriSpeech"),
+                            data_set.replace("_", "-"), )
         __process_data(
-            os.path.join(os.path.join(data_root, "LibriSpeech"), data_set.replace("_", "-"),),
-            os.path.join(os.path.join(data_root, "LibriSpeech"), data_set.replace("_", "-"),) + "-processed",
+            data_folder,
+            data_folder + "-processed",
             os.path.join(data_root, data_set + ".json"),
+            audio_format="wav",
         )
+        __process_data(
+            data_folder,
+            data_folder + "-processed",
+            os.path.join(data_root, data_set + ".json"),
+            audio_format="mp3",
+        )
+        #shutil.rmtree(data_folder)
+
     logging.info('Done!')
 
 
