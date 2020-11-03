@@ -38,6 +38,7 @@ import random
 import librosa
 import numpy as np
 import soundfile as sf
+import torchaudio
 
 
 class AudioSegment(object):
@@ -121,17 +122,17 @@ class AudioSegment(object):
         :param duration: duration in seconds when loading audio
         :return: numpy array of samples
         """
-        with sf.SoundFile(audio_file, 'r') as f:
-            dtype = 'int32' if int_values else 'float32'
-            sample_rate = f.samplerate
-            if offset > 0:
-                f.seek(int(offset * sample_rate))
-            if duration > 0:
-                samples = f.read(int(duration * sample_rate), dtype=dtype)
-            else:
-                samples = f.read(dtype=dtype)
+        si,_  = torchaudio.backend.sox_backend.info(audio_file)
+        sample_rate = si.rate
+        assert si.precision == 16,si.precision
 
-        samples = samples.transpose()
+        samples, sample_rate = torchaudio.backend.sox_backend.load(
+            audio_file,
+            normalization=True,
+            num_frames = int(duration * sample_rate)
+        )
+        samples = samples.data.numpy().squeeze()
+
         return cls(samples, sample_rate, target_sr=target_sr, trim=trim, orig_sr=orig_sr)
 
     @classmethod
