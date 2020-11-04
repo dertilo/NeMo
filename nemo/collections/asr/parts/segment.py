@@ -126,9 +126,8 @@ class AudioSegment(object):
         sample_rate = si.rate
         assert si.precision == 16,si.precision
 
-        samples, sample_rate = torchaudio.backend.sox_backend.load(
+        samples, sample_rate = torchaudio.backend.sox_io_backend.load(
             audio_file,
-            normalization=True,
             num_frames = int(duration * sample_rate)
         )
         samples = samples.data.numpy().squeeze()
