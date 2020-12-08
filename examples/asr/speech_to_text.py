@@ -65,10 +65,15 @@ Overide optimizer entirely
 
 @hydra_runner(config_path="conf", config_name="config")
 def main(cfg):
+    import nemo.collections.asr as nemo_asr
+
     trainer = pl.Trainer(**cfg.trainer)
     exp_manager(trainer, cfg.get("exp_manager", None))
-    asr_model = EncDecCTCModel(cfg=cfg.model, trainer=trainer)
-
+    asr_model = nemo_asr.models.EncDecCTCModel.from_pretrained(model_name="QuartzNet5x5LS-En")
+    asr_model.setup_training_data(train_data_config=cfg.model['train_ds'])
+    asr_model.setup_validation_data(val_data_config=cfg.model['validation_ds'])
+    # asr_model = EncDecCTCModel(cfg=cfg.model, trainer=trainer)
+    print(f"num trainable params: {asr_model.num_weights}")
     trainer.fit(asr_model)
 
 

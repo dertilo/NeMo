@@ -1,0 +1,48 @@
+name: nemo
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+  - anaconda
+dependencies:
+  - pip
+  - python=3.8
+  - cudatoolkit=10.1
+  - pytorch=1.6.0
+  - pytorch-lightning>=1.0.3
+  - tqdm
+  - numba
+  - python-levenshtein
+  - wandb
+  - pip:
+      - numpy>=1.18.2
+      - onnx>=1.7.0
+      - python-dateutil
+      - wrapt
+      - ruamel.yaml
+      - scikit-learn
+      - omegaconf>=2.0.2
+      - hydra-core>=1.0.3
+      - transformers>=3.1.0
+
+      - wget
+      - braceexpand
+      - editdistance
+      - frozendict
+      - inflect
+      - kaldi-io
+      - librosa
+      - marshmallow
+      - packaging
+      - num2words
+      - soundfile
+      - sox
+      - torch-stft
+      - unidecode
+      - webdataset
+      - kaldi-python-io
+      - scipy
+      - pandas
+      - g2p_en
+      - "util@git+https://git@github.com/dertilo/util.git#egg=util"
+

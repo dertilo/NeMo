@@ -8,7 +8,7 @@ labels: &labels [" ", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"
 
 model:
   train_ds:
-    manifest_filepath: ???
+    manifest_filepath: "/home/tilo/data/asr_data/ENGLISH/an4/train_manifest.json"
     sample_rate: 16000
     labels: *labels
     batch_size: 32
@@ -19,7 +19,7 @@ model:
     tarred_audio_filepaths: null
 
   validation_ds:
-    manifest_filepath: ???
+    manifest_filepath: "/home/tilo/data/asr_data/ENGLISH/an4/test_manifest.json"
     sample_rate: 16000
     labels: *labels
     batch_size: 32
@@ -162,10 +162,9 @@ model:
 
 trainer:
   gpus: 0 # number of gpus
-  max_epochs: 5
+  max_epochs: 0
   max_steps: null # computed at runtime if not set
   num_nodes: 1
-  accelerator: ddp
   accumulate_grad_batches: 1
   checkpoint_callback: False  # Provided by exp_manager
   logger: False  # Provided by exp_manager
