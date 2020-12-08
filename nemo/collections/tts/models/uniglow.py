@@ -19,6 +19,7 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import MISSING, DictConfig, OmegaConf, open_dict
 from pystoi import stoi
+from pytorch_lightning.loggers import LoggerCollection, TensorBoardLogger
 
 from nemo.collections.tts.helpers.helpers import OperationMode, waveglow_log_to_tb_func
 from nemo.collections.tts.losses.uniglowloss import UniGlowLoss
@@ -163,7 +164,7 @@ class UniGlowModel(Vocoder):
 
         # compute average stoi score for batch
         stoi_score = 0
-        sr = self._cfg.preprocessor.params.sample_rate
+        sr = self._cfg.preprocessor.sample_rate
         for audio_i, audio_recon_i in zip(audio.cpu(), predicted_audio.cpu()):
             stoi_score += stoi(audio_i, audio_recon_i, sr)
         stoi_score /= audio.shape[0]
@@ -178,8 +179,14 @@ class UniGlowModel(Vocoder):
 
     def validation_epoch_end(self, outputs):
         if self.logger is not None and self.logger.experiment is not None:
+            tb_logger = self.logger.experiment
+            if isinstance(self.logger, LoggerCollection):
+                for logger in self.logger:
+                    if isinstance(logger, TensorBoardLogger):
+                        tb_logger = logger.experiment
+                        break
             waveglow_log_to_tb_func(
-                self.logger.experiment,
+                tb_logger,
                 tuple(outputs[0].values())[:-1],
                 self.global_step,
                 tag="eval",
@@ -193,9 +200,9 @@ class UniGlowModel(Vocoder):
 
     def __setup_dataloader_from_config(self, cfg, shuffle_should_be: bool = True, name: str = "train"):
         if "dataset" not in cfg or not isinstance(cfg.dataset, DictConfig):
-            raise ValueError(f"No dataset for {name}")  # TODO
+            raise ValueError(f"No dataset for {name}")
         if "dataloader_params" not in cfg or not isinstance(cfg.dataloader_params, DictConfig):
-            raise ValueError(f"No dataloder_params for {name}")  # TODO
+            raise ValueError(f"No dataloder_params for {name}")
         if shuffle_should_be:
             if 'shuffle' not in cfg.dataloader_params:
                 logging.warning(
@@ -241,7 +248,7 @@ class UniGlowModel(Vocoder):
         Returns:
             An integer representing the upsampling factor
         """
-        audio = torch.ones(1, self._cfg.train_ds.dataset.params.n_segments)
+        audio = torch.ones(1, self._cfg.train_ds.dataset.n_segments)
         spec, spec_len = self.audio_to_melspec_precessor(audio, torch.FloatTensor([len(audio)]))
         spec = spec[:, :, :-1]
         audio = audio.unfold(1, self._cfg.uniglow.n_group, self._cfg.uniglow.n_group).permute(0, 2, 1)

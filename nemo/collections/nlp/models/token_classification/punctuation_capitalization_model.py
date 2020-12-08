@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import os
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
+import onnx
 import torch
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
@@ -25,19 +26,22 @@ from nemo.collections.nlp.data.token_classification.punctuation_capitalization_d
     BertPunctuationCapitalizationInferDataset,
 )
 from nemo.collections.nlp.metrics.classification_report import ClassificationReport
+from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.collections.nlp.modules.common import TokenClassifier
 from nemo.collections.nlp.modules.common.lm_utils import get_lm_model
 from nemo.collections.nlp.modules.common.tokenizer_utils import get_tokenizer
 from nemo.collections.nlp.parts.utils_funcs import tensor2list
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
+from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.modelPT import ModelPT
 from nemo.core.neural_types import LogitsType, NeuralType
 from nemo.utils import logging
+from nemo.utils.export_utils import attach_onnx_to_onnx
 
 __all__ = ['PunctuationCapitalizationModel']
 
 
-class PunctuationCapitalizationModel(ModelPT):
+class PunctuationCapitalizationModel(NLPModel, Exportable):
     @property
     def input_types(self) -> Optional[Dict[str, NeuralType]]:
         return self.bert_model.input_types
@@ -53,7 +57,7 @@ class PunctuationCapitalizationModel(ModelPT):
         """
         Initializes BERT Punctuation and Capitalization model.
         """
-        self._setup_tokenizer(cfg.tokenizer)
+        self.setup_tokenizer(cfg.tokenizer)
 
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -68,7 +72,7 @@ class PunctuationCapitalizationModel(ModelPT):
             hidden_size=self.bert_model.config.hidden_size,
             num_classes=len(self._cfg.punct_label_ids),
             activation=cfg.punct_head.activation,
-            log_softmax=cfg.punct_head.log_softmax,
+            log_softmax=False,
             dropout=cfg.punct_head.fc_dropout,
             num_layers=cfg.punct_head.punct_num_fc_layers,
             use_transformer_init=cfg.punct_head.use_transformer_init,
@@ -78,7 +82,7 @@ class PunctuationCapitalizationModel(ModelPT):
             hidden_size=self.bert_model.config.hidden_size,
             num_classes=len(self._cfg.capit_label_ids),
             activation=cfg.capit_head.activation,
-            log_softmax=cfg.capit_head.log_softmax,
+            log_softmax=False,
             dropout=cfg.capit_head.fc_dropout,
             num_layers=cfg.capit_head.capit_num_fc_layers,
             use_transformer_init=cfg.capit_head.use_transformer_init,
@@ -165,6 +169,33 @@ class PunctuationCapitalizationModel(ModelPT):
             'capit_fp': self.capit_class_report.fp,
         }
 
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
+        """
+        Lightning calls this inside the validation loop with the data from the validation dataloader
+        passed in as `batch`.
+        """
+        _, _, _, subtokens_mask, _, punct_labels, capit_labels = batch
+        test_loss, punct_logits, capit_logits = self._make_step(batch)
+
+        subtokens_mask = subtokens_mask > 0.5
+        punct_preds = torch.argmax(punct_logits, axis=-1)[subtokens_mask]
+        punct_labels = punct_labels[subtokens_mask]
+        self.punct_class_report.update(punct_preds, punct_labels)
+
+        capit_preds = torch.argmax(capit_logits, axis=-1)[subtokens_mask]
+        capit_labels = capit_labels[subtokens_mask]
+        self.capit_class_report.update(capit_preds, capit_labels)
+
+        return {
+            'test_loss': test_loss,
+            'punct_tp': self.punct_class_report.tp,
+            'punct_fn': self.punct_class_report.fn,
+            'punct_fp': self.punct_class_report.fp,
+            'capit_tp': self.capit_class_report.tp,
+            'capit_fn': self.capit_class_report.fn,
+            'capit_fp': self.capit_class_report.fp,
+        }
+
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
         """
         Called at the end of validation to aggregate outputs.
@@ -188,30 +219,47 @@ class PunctuationCapitalizationModel(ModelPT):
         self.log('capit_f1', capit_f1)
         self.log('capit_recall', capit_recall)
 
-        return {
-            'val_loss': avg_loss,
-            'punct_precision': punct_precision,
-            'punct_f1': punct_f1,
-            'punct_recall': punct_recall,
-            'capit_precision': capit_precision,
-            'capit_f1': capit_f1,
-            'capit_recall': capit_recall,
-        }
+    def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
+        """
+            Called at the end of test to aggregate outputs.
+            outputs: list of individual outputs of each validation step.
+        """
+        avg_loss = torch.stack([x['test_loss'] for x in outputs]).mean()
 
-    def _setup_tokenizer(self, cfg: DictConfig):
-        tokenizer = get_tokenizer(
-            tokenizer_name=cfg.tokenizer_name,
-            vocab_file=self.register_artifact(config_path='tokenizer.vocab_file', src=cfg.vocab_file),
-            special_tokens=OmegaConf.to_container(cfg.special_tokens) if cfg.special_tokens else None,
-            tokenizer_model=self.register_artifact(config_path='tokenizer.tokenizer_model', src=cfg.tokenizer_model),
-        )
-        self.tokenizer = tokenizer
+        # calculate metrics and log classification report for Punctuation task
+        punct_precision, punct_recall, punct_f1, punct_report = self.punct_class_report.compute()
+        logging.info(f'Punctuation report: {punct_report}')
 
-    def setup_training_data(self, train_data_config: Optional[DictConfig] = None, data_dir=None):
+        # calculate metrics and log classification report for Capitalization task
+        capit_precision, capit_recall, capit_f1, capit_report = self.capit_class_report.compute()
+        logging.info(f'Capitalization report: {capit_report}')
+
+        self.log('test_loss', avg_loss, prog_bar=True)
+        self.log('punct_precision', punct_precision)
+        self.log('punct_f1', punct_f1)
+        self.log('punct_recall', punct_recall)
+        self.log('capit_precision', capit_precision)
+        self.log('capit_f1', capit_f1)
+        self.log('capit_recall', capit_recall)
+
+    def update_data_dir(self, data_dir: str) -> None:
+        """
+        Update data directory
+
+        Args:
+            data_dir: path to data directory
+        """
+        if os.path.exists(data_dir):
+            logging.info(f'Setting model.dataset.data_dir to {data_dir}.')
+            self._cfg.dataset.data_dir = data_dir
+        else:
+            raise ValueError(f'{data_dir} not found')
+
+    def setup_training_data(self, train_data_config: Optional[DictConfig] = None):
+        """Setup training data"""
         if train_data_config is None:
             train_data_config = self._cfg.train_ds
-        if data_dir:
-            self._cfg.dataset.data_dir = data_dir
+
         self._train_dl = self._setup_dataloader_from_config(cfg=train_data_config)
 
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -222,19 +270,22 @@ class PunctuationCapitalizationModel(ModelPT):
             self._cfg.punct_label_ids = OmegaConf.create(self._train_dl.dataset.punct_label_ids)
             self._cfg.capit_label_ids = OmegaConf.create(self._train_dl.dataset.capit_label_ids)
 
-    def setup_validation_data(
-        self, val_data_config: Optional[Dict] = None, data_dirs: Optional[Union[List[str], str]] = None
-    ):
+            OmegaConf.set_struct(self._cfg, False)
+            if not hasattr(self._cfg, "class_labels") or self._cfg.class_labels is None:
+                self._cfg.class_labels = {}
+            self._cfg.class_labels = OmegaConf.create(
+                {'punct_labels_file': 'punct_label_ids.csv', 'capit_labels_file': 'capit_label_ids.csv'}
+            )
+
+    def setup_validation_data(self, val_data_config: Optional[Dict] = None):
         """
         Setup validaton data
 
         val_data_config: validation data config
-        data_dirs: path or paths to validation data dirs, used when setup up data for pretrained model
         """
         if val_data_config is None:
             val_data_config = self._cfg.validation_ds
-        if data_dirs:
-            self._cfg.validation_ds.ds_item = data_dirs
+
         self._validation_dl = self._setup_dataloader_from_config(cfg=val_data_config)
 
     def setup_test_data(self, test_data_config: Optional[Dict] = None):
@@ -409,3 +460,101 @@ class PunctuationCapitalizationModel(ModelPT):
             )
         )
         return result
+
+    def _prepare_for_export(self):
+        return self.bert_model._prepare_for_export()
+
+    def export(
+        self,
+        output: str,
+        input_example=None,
+        output_example=None,
+        verbose=False,
+        export_params=True,
+        do_constant_folding=True,
+        keep_initializers_as_inputs=False,
+        onnx_opset_version: int = 12,
+        try_script: bool = False,
+        set_eval: bool = True,
+        check_trace: bool = True,
+        use_dynamic_axes: bool = True,
+    ):
+        """
+        Unlike other models' export() this one creates 5 output files, not 3:
+        punct_<output> - fused punctuation model (BERT+PunctuationClassifier)
+        capit_<output> - fused capitalization model (BERT+CapitalizationClassifier)
+        bert_<output> - common BERT neural net
+        punct_classifier_<output> - Punctuation Classifier neural net
+        capt_classifier_<output> - Capitalization Classifier neural net
+        """
+        if input_example is not None or output_example is not None:
+            logging.warning(
+                "Passed input and output examples will be ignored and recomputed since"
+                " PunctuationCapitalizationModel consists of three separate models with different"
+                " inputs and outputs."
+            )
+
+        qual_name = self.__module__ + '.' + self.__class__.__qualname__
+        output1 = os.path.join(os.path.dirname(output), 'bert_' + os.path.basename(output))
+        output1_descr = qual_name + ' BERT exported to ONNX'
+        bert_model_onnx = self.bert_model.export(
+            output1,
+            None,  # computed by input_example()
+            None,
+            verbose,
+            export_params,
+            do_constant_folding,
+            keep_initializers_as_inputs,
+            onnx_opset_version,
+            try_script,
+            set_eval,
+            check_trace,
+            use_dynamic_axes,
+        )
+
+        output2 = os.path.join(os.path.dirname(output), 'punct_classifier_' + os.path.basename(output))
+        output2_descr = qual_name + ' Punctuation Classifier exported to ONNX'
+        punct_classifier_onnx = self.punct_classifier.export(
+            output2,
+            None,  # computed by input_example()
+            None,
+            verbose,
+            export_params,
+            do_constant_folding,
+            keep_initializers_as_inputs,
+            onnx_opset_version,
+            try_script,
+            set_eval,
+            check_trace,
+            use_dynamic_axes,
+        )
+
+        output3 = os.path.join(os.path.dirname(output), 'capit_classifier_' + os.path.basename(output))
+        output3_descr = qual_name + ' Capitalization Classifier exported to ONNX'
+        capit_classifier_onnx = self.capit_classifier.export(
+            output3,
+            None,  # computed by input_example()
+            None,
+            verbose,
+            export_params,
+            do_constant_folding,
+            keep_initializers_as_inputs,
+            onnx_opset_version,
+            try_script,
+            set_eval,
+            check_trace,
+            use_dynamic_axes,
+        )
+
+        punct_output_model = attach_onnx_to_onnx(bert_model_onnx, punct_classifier_onnx, "PTCL")
+        output4 = os.path.join(os.path.dirname(output), 'punct_' + os.path.basename(output))
+        output4_descr = qual_name + ' Punctuation BERT+Classifier exported to ONNX'
+        onnx.save(punct_output_model, output4)
+        capit_output_model = attach_onnx_to_onnx(bert_model_onnx, capit_classifier_onnx, "CPCL")
+        output5 = os.path.join(os.path.dirname(output), 'capit_' + os.path.basename(output))
+        output5_descr = qual_name + ' Capitalization BERT+Classifier exported to ONNX'
+        onnx.save(capit_output_model, output5)
+        return (
+            [output1, output2, output3, output4, output5],
+            [output1_descr, output2_descr, output3_descr, output4_descr, output5_descr],
+        )

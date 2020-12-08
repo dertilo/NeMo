@@ -22,6 +22,7 @@ import string
 from collections import Counter
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from nemo.utils import logging
 
@@ -50,7 +51,6 @@ __all__ = [
     'dataset_to_ids',
     'get_freq_weights',
     'fill_class_weights',
-    'calc_class_weights',
     'normalize_answer',
     'get_labels_to_labels_id_mapping',
     'get_vocab',
@@ -331,8 +331,8 @@ def get_labels_to_labels_id_mapping(file):
     '''
     lines = open(file, 'r').readlines()
     lines = [line.strip() for line in lines if line.strip()]
-    labels = {lines[i]: i for i in range(len(lines))}
-    return labels
+    label_ids = {lines[i]: i for i in range(len(lines))}
+    return label_ids
 
 
 def if_exist(outfold, files):
@@ -373,7 +373,7 @@ def dataset_to_ids(dataset, tokenizer, cache_ids=False, add_bos_eos=True):
         logging.info("Tokenizing dataset ...")
         data = open(dataset, "rb").readlines()
         ids = []
-        for sentence in data:
+        for sentence in tqdm(data, desc='Tokenizing sentence'):
             sent_ids = tokenizer.text_to_ids(sentence.decode("utf-8"))
             if add_bos_eos:
                 sent_ids = [tokenizer.bos_id] + sent_ids + [tokenizer.eos_id]
@@ -418,11 +418,6 @@ def fill_class_weights(weights, max_id=-1):
         if i in weights:
             all_weights[i] = weights[i]
     return all_weights
-
-
-def calc_class_weights(label_freq, max_id=-1):
-    weights_dict = get_freq_weights(label_freq)
-    return fill_class_weights(weights_dict, max_id=max_id)
 
 
 def get_vocab(file):

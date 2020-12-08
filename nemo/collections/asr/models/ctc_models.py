@@ -20,17 +20,18 @@ from typing import Dict, List, Optional, Union
 
 import onnx
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
 
-from nemo.collections.asr.data.audio_to_text import AudioToCharDataset, TarredAudioToCharDataset
+from nemo.collections.asr.data import audio_to_text_dataset
+from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
 from nemo.collections.asr.losses.ctc import CTCLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.parts.perturb import process_augmentations
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.exportable import Exportable
-from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, LogprobsType, NeuralType
+from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, LogprobsType, NeuralType, SpectrogramType
 from nemo.utils import logging
 from nemo.utils.export_utils import attach_onnx_to_onnx
 
@@ -88,16 +89,33 @@ class EncDecCTCModel(ASRModel, Exportable):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         # Get global rank and total number of GPU workers for IterableDataset partitioning, if applicable
         self.global_rank = 0
-        self.world_size = 0
+        self.world_size = 1
+        self.local_rank = 0
         if trainer is not None:
             self.global_rank = (trainer.node_rank * trainer.num_gpus) + trainer.local_rank
             self.world_size = trainer.num_nodes * trainer.num_gpus
+            self.local_rank = trainer.local_rank
 
         super().__init__(cfg=cfg, trainer=trainer)
         self.preprocessor = EncDecCTCModel.from_config_dict(self._cfg.preprocessor)
         self.encoder = EncDecCTCModel.from_config_dict(self._cfg.encoder)
+
+        with open_dict(self._cfg):
+            if "feat_in" not in self._cfg.decoder or (
+                not self._cfg.decoder.feat_in and hasattr(self.encoder, '_feat_out')
+            ):
+                self._cfg.decoder.feat_in = self.encoder._feat_out
+            if "feat_in" not in self._cfg.decoder or not self._cfg.decoder.feat_in:
+                raise ValueError("param feat_in of the decoder's config is not set!")
+
         self.decoder = EncDecCTCModel.from_config_dict(self._cfg.decoder)
-        self.loss = CTCLoss(num_classes=self.decoder.num_classes_with_blank - 1, zero_infinity=True)
+
+        self.loss = CTCLoss(
+            num_classes=self.decoder.num_classes_with_blank - 1,
+            zero_infinity=True,
+            reduction=self._cfg.get("ctc_reduction", "mean_batch"),
+        )
+
         if hasattr(self._cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecCTCModel.from_config_dict(self._cfg.spec_augment)
         else:
@@ -107,9 +125,10 @@ class EncDecCTCModel(ASRModel, Exportable):
         self._wer = WER(
             vocabulary=self.decoder.vocabulary,
             batch_dim_index=0,
-            use_cer=False,
+            use_cer=self._cfg.get('use_cer', False),
             ctc_decode=True,
             dist_sync_on_step=True,
+            log_prediction=self._cfg.get("log_prediction", False),
         )
 
     @torch.no_grad()
@@ -137,7 +156,12 @@ class EncDecCTCModel(ASRModel, Exportable):
         # Model's mode and device
         mode = self.training
         device = next(self.parameters()).device
+        dither_value = self.preprocessor.featurizer.dither
+        pad_to_value = self.preprocessor.featurizer.pad_to
+
         try:
+            self.preprocessor.featurizer.dither = 0.0
+            self.preprocessor.featurizer.pad_to = 0
             # Switch model to evaluation mode
             self.eval()
             logging_level = logging.get_verbosity()
@@ -166,6 +190,8 @@ class EncDecCTCModel(ASRModel, Exportable):
         finally:
             # set mode back to its original value
             self.train(mode=mode)
+            self.preprocessor.featurizer.dither = dither_value
+            self.preprocessor.featurizer.pad_to = pad_to_value
             logging.set_verbosity(logging_level)
         return hypotheses
 
@@ -193,18 +219,24 @@ class EncDecCTCModel(ASRModel, Exportable):
                 raise ValueError(f'New vocabulary must be non-empty list of chars. But I got: {new_vocabulary}')
             decoder_config = self.decoder.to_config_dict()
             new_decoder_config = copy.deepcopy(decoder_config)
-            new_decoder_config['params']['vocabulary'] = new_vocabulary
-            new_decoder_config['params']['num_classes'] = len(new_vocabulary)
+            new_decoder_config['vocabulary'] = new_vocabulary
+            new_decoder_config['num_classes'] = len(new_vocabulary)
+
             del self.decoder
             self.decoder = EncDecCTCModel.from_config_dict(new_decoder_config)
             del self.loss
-            self.loss = CTCLoss(num_classes=self.decoder.num_classes_with_blank - 1, zero_infinity=True)
+            self.loss = CTCLoss(
+                num_classes=self.decoder.num_classes_with_blank - 1,
+                zero_infinity=True,
+                reduction=self._cfg.get("ctc_reduction", "mean_batch"),
+            )
             self._wer = WER(
                 vocabulary=self.decoder.vocabulary,
                 batch_dim_index=0,
-                use_cer=False,
+                use_cer=self._cfg.get('use_cer', False),
                 ctc_decode=True,
                 dist_sync_on_step=True,
+                log_prediction=self._cfg.get("log_prediction", False),
             )
 
             # Update config
@@ -221,6 +253,18 @@ class EncDecCTCModel(ASRModel, Exportable):
             augmentor = None
 
         shuffle = config['shuffle']
+        device = 'gpu' if torch.cuda.is_available() else 'cpu'
+        if config.get('use_dali', False):
+            device_id = self.local_rank if device == 'gpu' else None
+            dataset = audio_to_text_dataset.get_dali_char_dataset(
+                config=config,
+                shuffle=shuffle,
+                device_id=device_id,
+                global_rank=self.global_rank,
+                world_size=self.world_size,
+                preprocessor_cfg=self._cfg.preprocessor,
+            )
+            return dataset
 
         # Instantiate tarred dataset loader or normal dataset loader
         if config.get('is_tarred', False):
@@ -233,26 +277,13 @@ class EncDecCTCModel(ASRModel, Exportable):
                 )
                 return None
 
-            shuffle_n = config.get('shuffle_n', 4 * config['batch_size'])
-            dataset = TarredAudioToCharDataset(
-                audio_tar_filepaths=config['tarred_audio_filepaths'],
-                manifest_filepath=config['manifest_filepath'],
-                labels=config['labels'],
-                sample_rate=config['sample_rate'],
-                int_values=config.get('int_values', False),
-                augmentor=augmentor,
+            shuffle_n = config.get('shuffle_n', 4 * config['batch_size']) if shuffle else 0
+            dataset = audio_to_text_dataset.get_tarred_char_dataset(
+                config=config,
                 shuffle_n=shuffle_n,
-                max_duration=config.get('max_duration', None),
-                min_duration=config.get('min_duration', None),
-                max_utts=config.get('max_utts', 0),
-                blank_index=config.get('blank_index', -1),
-                unk_index=config.get('unk_index', -1),
-                normalize=config.get('normalize_transcripts', False),
-                trim=config.get('trim_silence', True),
-                parser=config.get('parser', 'en'),
-                add_misc=config.get('add_misc', False),
                 global_rank=self.global_rank,
                 world_size=self.world_size,
+                augmentor=augmentor,
             )
             shuffle = False
         else:
@@ -260,23 +291,7 @@ class EncDecCTCModel(ASRModel, Exportable):
                 logging.warning(f"Could not load dataset as `manifest_filepath` was None. Provided config : {config}")
                 return None
 
-            dataset = AudioToCharDataset(
-                manifest_filepath=config['manifest_filepath'],
-                labels=config['labels'],
-                sample_rate=config['sample_rate'],
-                int_values=config.get('int_values', False),
-                augmentor=augmentor,
-                max_duration=config.get('max_duration', None),
-                min_duration=config.get('min_duration', None),
-                max_utts=config.get('max_utts', 0),
-                blank_index=config.get('blank_index', -1),
-                unk_index=config.get('unk_index', -1),
-                normalize=config.get('normalize_transcripts', False),
-                trim=config.get('trim_silence', True),
-                load_audio=config.get('load_audio', True),
-                parser=config.get('parser', 'en'),
-                add_misc=config.get('add_misc', False),
-            )
+            dataset = audio_to_text_dataset.get_char_dataset(config=config, augmentor=augmentor)
 
         return torch.utils.data.DataLoader(
             dataset=dataset,
@@ -331,12 +346,14 @@ class EncDecCTCModel(ASRModel, Exportable):
     @property
     def input_types(self) -> Optional[Dict[str, NeuralType]]:
         if hasattr(self.preprocessor, '_sample_rate'):
-            audio_eltype = AudioSignal(freq=self.preprocessor._sample_rate)
+            input_signal_eltype = AudioSignal(freq=self.preprocessor._sample_rate)
         else:
-            audio_eltype = AudioSignal()
+            input_signal_eltype = AudioSignal()
         return {
-            "input_signal": NeuralType(('B', 'T'), audio_eltype),
-            "input_signal_length": NeuralType(tuple('B'), LengthsType()),
+            "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
+            "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
+            "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
     @property
@@ -348,24 +365,40 @@ class EncDecCTCModel(ASRModel, Exportable):
         }
 
     @typecheck()
-    def forward(self, input_signal, input_signal_length):
-        processed_signal, processed_signal_len = self.preprocessor(
-            input_signal=input_signal, length=input_signal_length,
-        )
-        # Spec augment is not applied during evaluation/testing
+    def forward(
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+    ):
+        has_input_signal = input_signal is not None and input_signal_length is not None
+        has_processed_signal = processed_signal is not None and processed_signal_length is not None
+        if (has_input_signal ^ has_processed_signal) == False:
+            raise ValueError(
+                f"{self} Arguments ``input_signal`` and ``input_signal_length`` are mutually exclusive "
+                " with ``processed_signal`` and ``processed_signal_len`` arguments."
+            )
+
+        if not has_processed_signal:
+            processed_signal, processed_signal_length = self.preprocessor(
+                input_signal=input_signal, length=input_signal_length,
+            )
+
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal)
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_len)
+
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         log_probs = self.decoder(encoder_output=encoded)
         greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
         return log_probs, encoded_len, greedy_predictions
 
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
-        audio_signal, audio_signal_len, transcript, transcript_len = batch
-        log_probs, encoded_len, predictions = self.forward(
-            input_signal=audio_signal, input_signal_length=audio_signal_len
-        )
+        signal, signal_len, transcript, transcript_len = batch
+        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            log_probs, encoded_len, predictions = self.forward(
+                processed_signal=signal, processed_signal_length=signal_len
+            )
+        else:
+            log_probs, encoded_len, predictions = self.forward(input_signal=signal, input_signal_length=signal_len)
+
         loss_value = self.loss(
             log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
         )
@@ -378,21 +411,27 @@ class EncDecCTCModel(ASRModel, Exportable):
             log_every_n_steps = 1
 
         if (batch_nb + 1) % log_every_n_steps == 0:
-            self._wer.update(predictions, transcript, transcript_len)
+            self._wer.update(
+                predictions=predictions, targets=transcript, target_lengths=transcript_len,
+            )
             wer, _, _ = self._wer.compute()
             tensorboard_logs.update({'training_batch_wer': wer})
 
         return {'loss': loss_value, 'log': tensorboard_logs}
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        audio_signal, audio_signal_len, transcript, transcript_len = batch
-        log_probs, encoded_len, predictions = self.forward(
-            input_signal=audio_signal, input_signal_length=audio_signal_len
-        )
+        signal, signal_len, transcript, transcript_len = batch
+        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            log_probs, encoded_len, predictions = self.forward(
+                processed_signal=signal, processed_signal_length=signal_len
+            )
+        else:
+            log_probs, encoded_len, predictions = self.forward(input_signal=signal, input_signal_length=signal_len)
+
         loss_value = self.loss(
             log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
         )
-        self._wer.update(predictions, transcript, transcript_len)
+        self._wer.update(predictions=predictions, targets=transcript, target_lengths=transcript_len)
         wer, wer_num, wer_denom = self._wer.compute()
         return {
             'val_loss': loss_value,
@@ -465,8 +504,11 @@ class EncDecCTCModel(ASRModel, Exportable):
                 " inputs and outputs."
             )
 
+        qual_name = self.__module__ + '.' + self.__class__.__qualname__
+        output1 = os.path.join(os.path.dirname(output), 'encoder_' + os.path.basename(output))
+        output1_descr = qual_name + ' Encoder exported to ONNX'
         encoder_onnx = self.encoder.export(
-            os.path.join(os.path.dirname(output), 'encoder_' + os.path.basename(output)),
+            output1,
             None,  # computed by input_example()
             None,
             verbose,
@@ -480,8 +522,10 @@ class EncDecCTCModel(ASRModel, Exportable):
             use_dynamic_axes,
         )
 
+        output2 = os.path.join(os.path.dirname(output), 'decoder_' + os.path.basename(output))
+        output2_descr = qual_name + ' Decoder exported to ONNX'
         decoder_onnx = self.decoder.export(
-            os.path.join(os.path.dirname(output), 'decoder_' + os.path.basename(output)),
+            output2,
             None,  # computed by input_example()
             None,
             verbose,
@@ -496,7 +540,9 @@ class EncDecCTCModel(ASRModel, Exportable):
         )
 
         output_model = attach_onnx_to_onnx(encoder_onnx, decoder_onnx, "DC")
+        output_descr = qual_name + ' Encoder+Decoder exported to ONNX'
         onnx.save(output_model, output)
+        return ([output, output1, output2], [output_descr, output1_descr, output2_descr])
 
 
 class JasperNet(EncDecCTCModel):

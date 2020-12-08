@@ -15,17 +15,19 @@
 import os
 from typing import Dict, List, Optional, Union
 
+import onnx
 import torch
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from torch.utils.data import DataLoader
 
 from nemo.collections.common.losses import CrossEntropyLoss
+from nemo.collections.nlp.data.data_utils.data_preprocessing import get_labels_to_labels_id_mapping
 from nemo.collections.nlp.data.token_classification.token_classification_dataset import (
     BertTokenClassificationDataset,
     BertTokenClassificationInferDataset,
 )
-from nemo.collections.nlp.data.token_classification.token_classification_descriptor import TokenClassificationDataDesc
+from nemo.collections.nlp.data.token_classification.token_classification_utils import get_label_ids
 from nemo.collections.nlp.metrics.classification_report import ClassificationReport
 from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.collections.nlp.modules.common import TokenClassifier
@@ -33,13 +35,15 @@ from nemo.collections.nlp.modules.common.lm_utils import get_lm_model
 from nemo.collections.nlp.modules.common.tokenizer_utils import get_tokenizer
 from nemo.collections.nlp.parts.utils_funcs import get_classification_report, plot_confusion_matrix, tensor2list
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
+from nemo.core.classes.exportable import Exportable
 from nemo.core.neural_types import NeuralType
 from nemo.utils import logging
+from nemo.utils.export_utils import attach_onnx_to_onnx
 
 __all__ = ['TokenClassificationModel']
 
 
-class TokenClassificationModel(NLPModel):
+class TokenClassificationModel(NLPModel, Exportable):
     """Token Classification Model with BERT, applicable for tasks such as Named Entity Recognition"""
 
     @property
@@ -52,15 +56,20 @@ class TokenClassificationModel(NLPModel):
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         """Initializes Token Classification Model."""
+        # extract str to int labels mapping if a mapping file provided
+        if isinstance(cfg.label_ids, str):
+            if os.path.exists(cfg.label_ids):
+                logging.info(f'Reusing label_ids file found at {cfg.label_ids}.')
+                label_ids = get_labels_to_labels_id_mapping(cfg.label_ids)
+                # update the config to store name to id mapping
+                cfg.label_ids = OmegaConf.create(label_ids)
+            else:
+                raise ValueError(f'{cfg.label_ids} not found.')
 
-        self._setup_tokenizer(cfg.tokenizer)
-
-        self._cfg = cfg
-        self.data_desc = None
-        self.update_data_dir(cfg.dataset.data_dir)
-        self.setup_loss(class_balancing=self._cfg.dataset.class_balancing)
-
+        self.setup_tokenizer(cfg.tokenizer)
+        self.class_weights = None
         super().__init__(cfg=cfg, trainer=trainer)
+
         self.bert_model = get_lm_model(
             pretrained_model_name=cfg.language_model.pretrained_model_name,
             config_file=cfg.language_model.config_file,
@@ -73,12 +82,13 @@ class TokenClassificationModel(NLPModel):
             num_classes=len(self._cfg.label_ids),
             num_layers=self._cfg.head.num_fc_layers,
             activation=self._cfg.head.activation,
-            log_softmax=self._cfg.head.log_softmax,
+            log_softmax=False,
             dropout=self._cfg.head.fc_dropout,
             use_transformer_init=self._cfg.head.use_transformer_init,
         )
 
         self.loss = self.setup_loss(class_balancing=self._cfg.dataset.class_balancing)
+
         # setup to track metrics
         self.classification_report = ClassificationReport(
             len(self._cfg.label_ids), label_ids=self._cfg.label_ids, dist_sync_on_step=True
@@ -92,29 +102,25 @@ class TokenClassificationModel(NLPModel):
         Args:
             data_dir: path to data directory
         """
-        modes = ["train", "test", "dev"]
         self._cfg.dataset.data_dir = data_dir
         logging.info(f'Setting model.dataset.data_dir to {data_dir}.')
-        if os.path.exists(data_dir):
-            self.data_desc = TokenClassificationDataDesc(
-                data_dir=data_dir,
-                modes=modes,
-                pad_label=self._cfg.dataset.pad_label,
-                label_ids_dict=self._cfg.label_ids,
-            )
 
     def setup_loss(self, class_balancing: str = None):
         """Setup loss
-           Call this method only after update_data_dir() so that self.data_desc has class weights stats
+           Setup or update loss.
 
         Args:
             class_balancing: whether to use class weights during training
         """
-        if class_balancing == 'weighted_loss' and self.data_desc:
+        if class_balancing not in ['weighted_loss', None]:
+            raise ValueError(f'Class balancing {class_balancing} is not supported. Choose from: [null, weighted_loss]')
+        if class_balancing == 'weighted_loss' and self.class_weights:
             # you may need to increase the number of epochs for convergence when using weighted_loss
-            loss = CrossEntropyLoss(logits_ndim=3, weight=self.data_desc.class_weights)
+            loss = CrossEntropyLoss(logits_ndim=3, weight=self.class_weights)
+            logging.debug(f'Using {class_balancing} class balancing.')
         else:
             loss = CrossEntropyLoss(logits_ndim=3)
+            logging.debug(f'Using CrossEntropyLoss class balancing.')
         return loss
 
     @typecheck()
@@ -177,34 +183,84 @@ class TokenClassificationModel(NLPModel):
         self.log('f1', f1)
         self.log('recall', recall)
 
-    def _setup_tokenizer(self, cfg: DictConfig):
-        tokenizer = get_tokenizer(
-            tokenizer_name=cfg.tokenizer_name,
-            vocab_file=self.register_artifact(config_path='tokenizer.vocab_file', src=cfg.vocab_file),
-            special_tokens=OmegaConf.to_container(cfg.special_tokens) if cfg.special_tokens else None,
-            tokenizer_model=self.register_artifact(config_path='tokenizer.tokenizer_model', src=cfg.tokenizer_model),
-        )
-        self.tokenizer = tokenizer
+    def test_step(self, batch, batch_idx):
+        input_ids, input_type_ids, input_mask, subtokens_mask, loss_mask, labels = batch
+        logits = self(input_ids=input_ids, token_type_ids=input_type_ids, attention_mask=input_mask)
+        val_loss = self.loss(logits=logits, labels=labels, loss_mask=loss_mask)
+
+        subtokens_mask = subtokens_mask > 0.5
+
+        preds = torch.argmax(logits, axis=-1)[subtokens_mask]
+        labels = labels[subtokens_mask]
+        tp, fn, fp, _ = self.classification_report(preds, labels)
+
+        return {'test_loss': val_loss, 'tp': tp, 'fn': fn, 'fp': fp}
+
+    def test_epoch_end(self, outputs):
+        avg_loss = torch.stack([x['test_loss'] for x in outputs]).mean()
+        # calculate metrics and classification report
+        precision, recall, f1, report = self.classification_report.compute()
+        logging.info(report)
+
+        self.log('test_loss', avg_loss, prog_bar=True)
+        self.log('precision', precision)
+        self.log('f1', f1)
+        self.log('recall', recall)
 
     def setup_training_data(self, train_data_config: Optional[DictConfig] = None):
         if train_data_config is None:
             train_data_config = self._cfg.train_ds
-        self._train_dl = self._setup_dataloader_from_config(cfg=train_data_config)
 
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            self.register_artifact('label_ids.csv', self.data_desc.label_ids_filename)
-            # save label maps to the config
-            self._cfg.label_ids = OmegaConf.create(self.data_desc.label_ids)
+        labels_file = os.path.join(self._cfg.dataset.data_dir, train_data_config.labels_file)
+        label_ids, label_ids_filename, self.class_weights = get_label_ids(
+            label_file=labels_file,
+            is_training=True,
+            pad_label=self._cfg.dataset.pad_label,
+            label_ids_dict=self._cfg.label_ids,
+            get_weights=True,
+        )
+        # save label maps to the config
+        self._cfg.label_ids = OmegaConf.create(label_ids)
+
+        OmegaConf.set_struct(self._cfg, False)
+        if not hasattr(self._cfg, "class_labels") or self._cfg.class_labels is None:
+            self._cfg.class_labels = {}
+
+        self._cfg.class_labels = OmegaConf.create({'class_labels_file': 'label_ids.csv'})
+        OmegaConf.set_struct(self._cfg, True)
+
+        self.register_artifact('label_ids.csv', label_ids_filename)
+        self._train_dl = self._setup_dataloader_from_config(cfg=train_data_config)
 
     def setup_validation_data(self, val_data_config: Optional[DictConfig] = None):
         if val_data_config is None:
             val_data_config = self._cfg.validation_ds
+
+        labels_file = os.path.join(self._cfg.dataset.data_dir, val_data_config.labels_file)
+        get_label_ids(
+            label_file=labels_file,
+            is_training=False,
+            pad_label=self._cfg.dataset.pad_label,
+            label_ids_dict=self._cfg.label_ids,
+            get_weights=False,
+        )
+
         self._validation_dl = self._setup_dataloader_from_config(cfg=val_data_config)
 
     def setup_test_data(self, test_data_config: Optional[DictConfig] = None):
         if test_data_config is None:
             test_data_config = self._cfg.test_ds
-        self._test_dl = self.__setup_dataloader_from_config(cfg=test_data_config)
+
+        labels_file = os.path.join(self._cfg.dataset.data_dir, test_data_config.labels_file)
+        get_label_ids(
+            label_file=labels_file,
+            is_training=False,
+            pad_label=self._cfg.dataset.pad_label,
+            label_ids_dict=self._cfg.label_ids,
+            get_weights=False,
+        )
+
+        self._test_dl = self._setup_dataloader_from_config(cfg=test_data_config)
 
     def _setup_dataloader_from_config(self, cfg: DictConfig) -> DataLoader:
         """
@@ -239,7 +295,7 @@ class TokenClassificationModel(NLPModel):
             tokenizer=self.tokenizer,
             num_samples=cfg.num_samples,
             pad_label=dataset_cfg.pad_label,
-            label_ids=self.data_desc.label_ids,
+            label_ids=self._cfg.label_ids,
             ignore_extra_tokens=dataset_cfg.ignore_extra_tokens,
             ignore_start_end=dataset_cfg.ignore_start_end,
             use_cache=dataset_cfg.use_cache,
@@ -278,6 +334,7 @@ class TokenClassificationModel(NLPModel):
             drop_last=False,
         )
 
+    @torch.no_grad()
     def _infer(self, queries: List[str], batch_size: int = None) -> List[int]:
         """
         Get prediction for the queries
@@ -314,17 +371,25 @@ class TokenClassificationModel(NLPModel):
             self.train(mode=mode)
         return all_preds
 
-    def add_predictions(self, queries: Union[List[str], str], batch_size: int = 32) -> List[str]:
+    def add_predictions(
+        self, queries: Union[List[str], str], batch_size: int = 32, output_file: Optional[str] = None
+    ) -> List[str]:
         """
         Add predicted token labels to the queries. Use this method for debugging and prototyping.
         Args:
             queries: text
             batch_size: batch size to use during inference.
+            output_file: file to save models predictions
         Returns:
             result: text with added entities
         """
         if queries is None or len(queries) == 0:
             return []
+
+        if isinstance(queries, str):
+            logging.info(f'Reading from {queries} file')
+            with open(queries, 'r') as f:
+                queries = f.readlines()
 
         result = []
         all_preds = self._infer(queries, batch_size)
@@ -361,6 +426,12 @@ class TokenClassificationModel(NLPModel):
                     query_with_entities += '[' + label + ']'
                 query_with_entities += punct + ' '
             result.append(query_with_entities.strip())
+
+        if output_file is not None:
+            with open(output_file, 'w') as f:
+                for r in result:
+                    f.write(r + '\n')
+            logging.info(f'Predictions saved to {output_file}')
         return result
 
     def evaluate_from_file(
@@ -370,8 +441,8 @@ class TokenClassificationModel(NLPModel):
         labels_file: Optional[str] = None,
         add_confusion_matrix: Optional[bool] = False,
         normalize_confusion_matrix: Optional[bool] = True,
-        batch_size: int = 32,
-    ) -> List[str]:
+        batch_size: int = 1,
+    ) -> None:
         """
         Run inference on data from a file, plot confusion matrix and calculate classification report.
         Use this method for final evaluation.
@@ -386,8 +457,6 @@ class TokenClassificationModel(NLPModel):
             add_confusion_matrix: whether to generate confusion matrix
             normalize_confusion_matrix: whether to normalize confusion matrix
             batch_size: batch size to use during inference.
-        Returns:
-            result: text with added capitalization and punctuation
         """
         output_dir = os.path.abspath(output_dir)
 
@@ -421,7 +490,7 @@ class TokenClassificationModel(NLPModel):
                 # convert labels from string label to ids
                 label_ids = self._cfg.label_ids
                 all_labels = [label_ids[label] for label in all_labels]
-                print(len(all_labels), len(all_preds))
+
                 plot_confusion_matrix(
                     all_labels, all_preds, output_dir, label_ids=label_ids, normalize=normalize_confusion_matrix
                 )
@@ -449,3 +518,68 @@ class TokenClassificationModel(NLPModel):
         )
         result.append(model)
         return result
+
+    def _prepare_for_export(self):
+        return self.bert_model._prepare_for_export()
+
+    def export(
+        self,
+        output: str,
+        input_example=None,
+        output_example=None,
+        verbose=False,
+        export_params=True,
+        do_constant_folding=True,
+        keep_initializers_as_inputs=False,
+        onnx_opset_version: int = 12,
+        try_script: bool = False,
+        set_eval: bool = True,
+        check_trace: bool = True,
+        use_dynamic_axes: bool = True,
+    ):
+        if input_example is not None or output_example is not None:
+            logging.warning(
+                "Passed input and output examples will be ignored and recomputed since"
+                " TokenClassificationModel consists of two separate models with different"
+                " inputs and outputs."
+            )
+
+        qual_name = self.__module__ + '.' + self.__class__.__qualname__
+        output1 = os.path.join(os.path.dirname(output), 'bert_' + os.path.basename(output))
+        output1_descr = qual_name + ' BERT exported to ONNX'
+        bert_model_onnx = self.bert_model.export(
+            output1,
+            None,  # computed by input_example()
+            None,
+            verbose,
+            export_params,
+            do_constant_folding,
+            keep_initializers_as_inputs,
+            onnx_opset_version,
+            try_script,
+            set_eval,
+            check_trace,
+            use_dynamic_axes,
+        )
+
+        output2 = os.path.join(os.path.dirname(output), 'classifier_' + os.path.basename(output))
+        output2_descr = qual_name + ' Classifier exported to ONNX'
+        classifier_onnx = self.classifier.export(
+            output2,
+            None,  # computed by input_example()
+            None,
+            verbose,
+            export_params,
+            do_constant_folding,
+            keep_initializers_as_inputs,
+            onnx_opset_version,
+            try_script,
+            set_eval,
+            check_trace,
+            use_dynamic_axes,
+        )
+
+        output_model = attach_onnx_to_onnx(bert_model_onnx, classifier_onnx, "TKCL")
+        output_descr = qual_name + ' BERT+Classifier exported to ONNX'
+        onnx.save(output_model, output)
+        return ([output, output1, output2], [output_descr, output1_descr, output2_descr])

@@ -18,14 +18,16 @@ from typing import Any, Dict, Optional
 import torch
 from hydra.utils import instantiate
 from omegaconf import MISSING, DictConfig, OmegaConf, open_dict
+from pytorch_lightning.loggers import LoggerCollection, TensorBoardLogger
 
 from nemo.collections.tts.helpers.helpers import OperationMode, waveglow_log_to_tb_func
 from nemo.collections.tts.losses.waveglowloss import WaveGlowLoss
-from nemo.collections.tts.models.base import Vocoder
+from nemo.collections.tts.models.base import GlowVocoder
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.neural_types.elements import (
     AudioSignal,
     LengthsType,
+    LogDeterminantType,
     MelSpectrogramType,
     NormalDistributionSamplesType,
     VoidType,
@@ -43,7 +45,7 @@ class WaveglowConfig:
     validation_ds: Optional[Dict[Any, Any]] = None
 
 
-class WaveGlowModel(Vocoder):
+class WaveGlowModel(GlowVocoder):
     """Waveglow model used to convert betweeen spectrograms and audio"""
 
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
@@ -63,15 +65,10 @@ class WaveGlowModel(Vocoder):
         self.sigma = self._cfg.sigma
         self.audio_to_melspec_precessor = instantiate(self._cfg.preprocessor)
         self.waveglow = instantiate(self._cfg.waveglow)
-        self.mode = OperationMode.infer
         self.loss = WaveGlowLoss()
         self.removed_weightnorm = False
 
-    @property
-    def mode(self):
-        return self._mode
-
-    @mode.setter
+    @GlowVocoder.mode.setter
     def mode(self, new_mode):
         if new_mode == OperationMode.training:
             self.train()
@@ -94,7 +91,7 @@ class WaveGlowModel(Vocoder):
             output_dict = {
                 "pred_normal_dist": NeuralType(('B', 'flowgroup', 'T'), NormalDistributionSamplesType()),
                 "log_s_list": NeuralType(('B', 'flowgroup', 'T'), VoidType()),  # TODO: Figure out a good typing
-                "log_det_W_list": NeuralType(elements_type=VoidType()),  # TODO: Figure out a good typing
+                "log_det_W_list": NeuralType(elements_type=LogDeterminantType()),
             }
             if self.mode == OperationMode.validation:
                 output_dict["audio_pred"] = NeuralType(('B', 'T'), AudioSignal())
@@ -121,17 +118,25 @@ class WaveGlowModel(Vocoder):
         return tensors  # audio_pred
 
     @typecheck(
-        input_types={"spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()), "sigma": NeuralType(optional=True)},
+        input_types={
+            "spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()),
+            "sigma": NeuralType(optional=True),
+            "denoise": NeuralType(optional=True),
+            "denoiser_strength": NeuralType(optional=True),
+        },
         output_types={"audio": NeuralType(('B', 'T'), AudioSignal())},
     )
-    def convert_spectrogram_to_audio(self, spec: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
-        if not self.removed_weightnorm:
-            self.waveglow.remove_weightnorm()
-            self.removed_weightnorm = True
-        self.mode = OperationMode.infer
+    def convert_spectrogram_to_audio(
+        self, spec: torch.Tensor, sigma: float = 1.0, denoise: bool = True, denoiser_strength: float = 0.01
+    ) -> torch.Tensor:
+        with self.nemo_infer():
+            if not self.removed_weightnorm:
+                self.waveglow.remove_weightnorm()
+                self.removed_weightnorm = True
 
-        with torch.no_grad():
             audio = self.waveglow(spec=spec, run_inverse=True, audio=None, sigma=sigma)
+            if denoise:
+                audio = self.denoise(audio, denoiser_strength)
 
         return audio
 
@@ -164,8 +169,14 @@ class WaveGlowModel(Vocoder):
 
     def validation_epoch_end(self, outputs):
         if self.logger is not None and self.logger.experiment is not None:
+            tb_logger = self.logger.experiment
+            if isinstance(self.logger, LoggerCollection):
+                for logger in self.logger:
+                    if isinstance(logger, TensorBoardLogger):
+                        tb_logger = logger.experiment
+                        break
             waveglow_log_to_tb_func(
-                self.logger.experiment,
+                tb_logger,
                 outputs[0].values(),
                 self.global_step,
                 tag="eval",
@@ -176,9 +187,9 @@ class WaveGlowModel(Vocoder):
 
     def __setup_dataloader_from_config(self, cfg, shuffle_should_be: bool = True, name: str = "train"):
         if "dataset" not in cfg or not isinstance(cfg.dataset, DictConfig):
-            raise ValueError(f"No dataset for {name}")  # TODO
+            raise ValueError(f"No dataset for {name}")
         if "dataloader_params" not in cfg or not isinstance(cfg.dataloader_params, DictConfig):
-            raise ValueError(f"No dataloder_params for {name}")  # TODO
+            raise ValueError(f"No dataloder_params for {name}")
         if shuffle_should_be:
             if 'shuffle' not in cfg.dataloader_params:
                 logging.warning(
