@@ -168,6 +168,10 @@ class AudioSegment(object):
                 num_frames=int(duration * sample_rate)
             )
             samples = samples.data.numpy().squeeze()
+            if offset > 0:
+                samples = samples[int(offset * sample_rate) :]
+            if duration > 0:
+                samples = samples[: int(duration * sample_rate)]
 
         if samples is None:
             samples = Audio.from_file(audio_file)
