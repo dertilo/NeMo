@@ -335,20 +335,33 @@ class ModelPT(LightningModule, Model):
         # Get path where the command is executed - the artifacts will be "retrieved" there
         # (original .nemo behavior)
         cwd = os.getcwd()
-        gpu_index_file=f"/home/thimmelsba/data/tmp/available_gpus.txt"
+        taken_gpus_file = f"/tmp/taken_gpus.txt"
+        from filelock import FileLock
+        from datetime import datetime
+
         def get_gpu_idx():
-            with open(gpu_index_file,"r") as f:
-                avail_gpus=f.readlines()
-            print(f"avail_gpus: {avail_gpus}")
-            idx=int(avail_gpus.pop(0).replace("\n",""))
-            print(f"taking gpu: {idx}")
-            with open(gpu_index_file,"w") as f:
-                f.writelines(avail_gpus)
+            all_gpus = [
+                torch.cuda.device(i).idx for i in range(torch.cuda.device_count())
+            ]
+
+            with FileLock(f"{taken_gpus_file}_lock"):
+                if os.path.isfile(taken_gpus_file):
+                    with open(taken_gpus_file, "r") as f:
+                        already_taken = [int(l) for l in f.readlines()]
+                    print(f"already taken: {already_taken}")
+                else:
+                    already_taken = []
+
+                idx = next(filter(lambda x: x not in already_taken, all_gpus))
+                print(f"{datetime.now()} all_gpus: {all_gpus}, taking gpu: {idx}")
+                with open(taken_gpus_file, "a") as f:
+                    f.write(f"{idx}\n")
+
             return idx
 
         if map_location is None:
             if torch.cuda.is_available():
-                map_location = torch.device(f"cuda:{get_gpu_idx()}")
+                map_location = torch.device('cuda')
             else:
                 map_location = torch.device('cpu')
 

@@ -42,6 +42,7 @@ import soundfile as sf
 from kaldiio.matio import read_kaldi
 from kaldiio.utils import open_like_kaldi
 from pydub import AudioSegment as Audio
+import torchaudio
 
 from nemo.utils import logging
 
@@ -147,7 +148,7 @@ class AudioSegment(object):
                 logging.error(
                     f"Loading audio via SoundFile raised RuntimeError: `{e}`. NeMo will fallback to loading via pydub."
                 )
-        elif isinstance(audio_file, str) and audio_file.strip()[-1] == "|":
+        elif isinstance(audio_file, str) and audio_file.strip()[-1] == "|" and not audio_file.endswith(".mp3"):
             f = open_like_kaldi(audio_file, "rb")
             sample_rate, samples = read_kaldi(f)
             if offset > 0:
@@ -157,6 +158,20 @@ class AudioSegment(object):
             if not int_values:
                 abs_max_value = np.abs(samples).max()
                 samples = np.array(samples, dtype=np.float) / abs_max_value
+        elif audio_file.endswith(".mp3"):
+            si, _ = torchaudio.backend.sox_backend.info(audio_file)
+            sample_rate = si.rate
+            assert si.precision == 16, si.precision
+
+            samples, sample_rate = torchaudio.backend.sox_io_backend.load(
+                audio_file,
+                num_frames=int(duration * sample_rate)
+            )
+            samples = samples.data.numpy().squeeze()
+            if offset > 0:
+                samples = samples[int(offset * sample_rate) :]
+            if duration > 0:
+                samples = samples[: int(duration * sample_rate)]
 
         if samples is None:
             samples = Audio.from_file(audio_file)
